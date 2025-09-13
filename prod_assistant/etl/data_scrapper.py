@@ -1,136 +1,116 @@
+import csv
+import time
+import re
 import os
-import pandas as pd
-from dotenv import load_dotenv
-from typing import List
-from langchain_core.documents import Document
-from langchain_astradb import AstraDBVectorStore
-from prod_assistant.utils.model_loader import ModelLoader
-from prod_assistant.utils.config_loader import load_config
+from bs4 import BeautifulSoup
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 
-class DataIngestion:
-    """
-    Class to handle data transformation and ingestion into AstraDB vector store.
-    """
+class FlipkartScraper:
+    def __init__(self, output_dir="data"):
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
 
-    def __init__(self):
+    def get_top_reviews(self,product_url,count=2):
+        """Get the top reviews for a product.
         """
-        Initialize environment variables, embedding model, and set CSV file path.
-        """
-        print("Initializing DataIngestion pipeline...")
-        self.model_loader=ModelLoader()
-        self._load_env_variables()
-        self.csv_path = self._get_csv_path()
-        self.product_data = self._load_csv()
-        self.config=load_config()
+        options = uc.ChromeOptions()
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        driver = uc.Chrome(options=options,use_subprocess=True)
 
-    def _load_env_variables(self):
+        if not product_url.startswith("http"):
+            driver.quit()
+            return "No reviews found"
+
+        try:
+            driver.get(product_url)
+            time.sleep(4)
+            try:
+                driver.find_element(By.XPATH, "//button[contains(text(), '✕')]").click()
+                time.sleep(1)
+            except Exception as e:
+                print(f"Error occurred while closing popup: {e}")
+
+            for _ in range(4):
+                ActionChains(driver).send_keys(Keys.END).perform()
+                time.sleep(1.5)
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            review_blocks = soup.select("div._27M-vq, div.col.EPCmJX, div._6K-7Co")
+            seen = set()
+            reviews = []
+
+            for block in review_blocks:
+                text = block.get_text(separator=" ", strip=True)
+                if text and text not in seen:
+                    reviews.append(text)
+                    seen.add(text)
+                if len(reviews) >= count:
+                    break
+        except Exception:
+            reviews = []
+
+        driver.quit()
+        return " || ".join(reviews) if reviews else "No reviews found"
+    
+    def scrape_flipkart_products(self, query, max_products=1, review_count=2):
+        """Scrape Flipkart products based on a search query.
         """
-        Load and validate required environment variables.
-        """
-        load_dotenv()
+        options = uc.ChromeOptions()
+        driver = uc.Chrome(options=options,use_subprocess=True)
+        search_url = f"https://www.flipkart.com/search?q={query.replace(' ', '+')}"
+        driver.get(search_url)
+        time.sleep(4)
+
+        try:
+            driver.find_element(By.XPATH, "//button[contains(text(), '✕')]").click()
+        except Exception as e:
+            print(f"Error occurred while closing popup: {e}")
+
+        time.sleep(2)
+        products = []
+
+        items = driver.find_elements(By.CSS_SELECTOR, "div[data-id]")[:max_products]
+        for item in items:
+            try:
+                title = item.find_element(By.CSS_SELECTOR, "div.KzDlHZ").text.strip()
+                price = item.find_element(By.CSS_SELECTOR, "div.Nx9bqj").text.strip()
+                rating = item.find_element(By.CSS_SELECTOR, "div.XQDdHH").text.strip()
+                reviews_text = item.find_element(By.CSS_SELECTOR, "span.Wphh3N").text.strip()
+                match = re.search(r"\d+(,\d+)?(?=\s+Reviews)", reviews_text)
+                total_reviews = match.group(0) if match else "N/A"
+
+                link_el = item.find_element(By.CSS_SELECTOR, "a[href*='/p/']")
+                href = link_el.get_attribute("href")
+                product_link = href if href.startswith("http") else "https://www.flipkart.com" + href
+                match = re.findall(r"/p/(itm[0-9A-Za-z]+)", href)
+                product_id = match[0] if match else "N/A"
+            except Exception as e:
+                print(f"Error occurred while processing item: {e}")
+                continue
+
+            top_reviews = self.get_top_reviews(product_link, count=review_count) if "flipkart.com" in product_link else "Invalid product URL"
+            products.append([product_id, title, rating, total_reviews, price, top_reviews])
+
+        driver.quit()
+        return products
+    
+    def save_to_csv(self, data, filename="product_reviews.csv"):
+        """Save the scraped product reviews to a CSV file."""
+        if os.path.isabs(filename):
+            path = filename
+        elif os.path.dirname(filename):  # filename includes subfolder like 'data/product_reviews.csv'
+            path = filename
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        else:
+            # plain filename like 'output.csv'
+            path = os.path.join(self.output_dir, filename)
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["product_id", "product_title", "rating", "total_reviews", "price", "top_reviews"])
+            writer.writerows(data)
         
-        required_vars = ["GOOGLE_API_KEY", "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN", "ASTRA_DB_KEYSPACE"]
-        
-        missing_vars = [var for var in required_vars if os.getenv(var) is None]
-        if missing_vars:
-            raise EnvironmentError(f"Missing environment variables: {missing_vars}")
-        
-        self.google_api_key = os.getenv("GOOGLE_API_KEY")
-        self.db_api_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
-        self.db_application_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
-        self.db_keyspace = os.getenv("ASTRA_DB_KEYSPACE")
-
-       
-
-    def _get_csv_path(self):
-        """
-        Get path to the CSV file located inside 'data' folder.
-        """
-        current_dir = os.getcwd()
-        csv_path = os.path.join(current_dir,'data', 'product_reviews.csv')
-
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found at: {csv_path}")
-
-        return csv_path
-
-    def _load_csv(self):
-        """
-        Load product data from CSV.
-        """
-        df = pd.read_csv(self.csv_path)
-        expected_columns = {'product_id','product_title', 'rating', 'total_reviews','price', 'top_reviews'}
-
-        if not expected_columns.issubset(set(df.columns)):
-            raise ValueError(f"CSV must contain columns: {expected_columns}")
-
-        return df
-
-    def transform_data(self):
-        """
-        Transform product data into list of LangChain Document objects.
-        """
-        product_list = []
-
-        for _, row in self.product_data.iterrows():
-            product_entry = {
-                    "product_id": row["product_id"],
-                    "product_title": row["product_title"],
-                    "rating": row["rating"],
-                    "total_reviews": row["total_reviews"],
-                    "price": row["price"],
-                    "top_reviews": row["top_reviews"]
-                }
-            product_list.append(product_entry)
-
-        documents = []
-        for entry in product_list:
-            metadata = {
-                    "product_id": entry["product_id"],
-                    "product_title": entry["product_title"],
-                    "rating": entry["rating"],
-                    "total_reviews": entry["total_reviews"],
-                    "price": entry["price"]
-            }
-            doc = Document(page_content=entry["top_reviews"], metadata=metadata)
-            documents.append(doc)
-
-        print(f"Transformed {len(documents)} documents.")
-        return documents
-
-    def store_in_vector_db(self, documents: List[Document]):
-        """
-        Store documents into AstraDB vector store.
-        """
-        collection_name=self.config["astra_db"]["collection_name"]
-        vstore = AstraDBVectorStore(
-            embedding= self.model_loader.load_embeddings(),
-            collection_name=collection_name,
-            api_endpoint=self.db_api_endpoint,
-            token=self.db_application_token,
-            namespace=self.db_keyspace,
-        )
-
-        inserted_ids = vstore.add_documents(documents)
-        print(f"Successfully inserted {len(inserted_ids)} documents into AstraDB.")
-        return vstore, inserted_ids
-
-    def run_pipeline(self):
-        """
-        Run the full data ingestion pipeline: transform data and store into vector DB.
-        """
-        documents = self.transform_data()
-        vstore, _ = self.store_in_vector_db(documents)
-
-        #Optionally do a quick search
-        query = "Can you tell me the low budget iphone?"
-        results = vstore.similarity_search(query)
-
-        print(f"\nSample search results for query: '{query}'")
-        for res in results:
-            print(f"Content: {res.page_content}\nMetadata: {res.metadata}\n")
-
-# Run if this file is executed directly
-if __name__ == "__main__":
-    ingestion = DataIngestion()
-    ingestion.run_pipeline()
